@@ -1,4 +1,5 @@
 § Script de la base de datos.
+
 CREATE TABLE estudiante (
 id_estudiante INT,
 nombres VARCHAR(100),
@@ -653,200 +654,194 @@ VALUES
 9, 'Viernes 07:00-08:30', 'Zona Verde', 18);
 
 § Descripción general del proyecto.
-El proyecto de base de datos escolar implementa cinco vistas que encapsulan las consultas más importantes del sistema, simplificando el acceso a información compleja sin necesidad de reescribir lógica SQL en cada consulta.
 
-View Rendimiento Académico:
-Muestra el rendimiento de cada estudiante por asignatura y periodo, calculando la nota definitiva como promedio ponderado real.
+Evento Recordatorios Examenes
+Se ejecuta diariamente. Busca en evento_calendario los eventos con palabras clave como "examen", "parcial" o "final" que ocurran en los próximos tres días y los registra en la tabla recordatorio_examen con la fecha y los días restantes. Permite mantener un historial de alertas académicas generadas de forma automática.
 
-View Horario Profesor:
-Presenta el horario semanal de cada profesor con aula, asignatura y duración del bloque. Los días se ordenan en orden natural de lunes a sábado.
+Evento Verificar Devoluciones Biblioteca
+Se ejecuta diariamente. Marca como Retrasado todo préstamo cuya fecha_devolucion ya venció y recalcula la multa acumulada a $1.000 COP por día de retraso usando DATEDIFF(CURDATE(), fecha_devolucion). Garantiza que el estado de la biblioteca esté siempre actualizado sin intervención del bibliotecario.
 
-View Ocupación Aulas:
-Detalla la ocupación de cada aula por día y franja horaria, con porcentaje de uso y nivel de ocupación.
+Evento Generar Reporte Asistencia
+Se ejecuta semanalmente. Consolida en reporte_asistencia_semanal la actividad de cada curso activo durante los últimos siete días: número de evaluaciones registradas, estudiantes evaluados y promedio del grupo. Clasifica cada curso con un nivel de actividad: Sin actividad, Baja, Media o Alta.
 
-View Material Bibliografico Prestado:
-Lista el material prestado con el nombre del usuario resuelto según tipo, días de retraso y multa calculada en tiempo real.
+Evento Actualizar Estado Matriculas
+Se ejecuta diariamente a medianoche. Compara las fechas reales del sistema con los campos fecha_inicio y fecha_fin de cada periodo académico y actualiza su estado de forma automática siguiendo el ciclo Planeado → Activo → Finalizado. Elimina la necesidad de que un administrador haga ese cambio manualmente.
 
-View Estadísticas Calificaciones:
-Consolida estadísticas de calificaciones por curso: promedio, valores extremos, desviación estándar y tasa de aprobación.
+Evento Programar Mantenimiento Aulas
+Se ejecuta semanalmente. Detecta las aulas con estado Disponible que no tienen cursos asignados en el periodo activo y genera un registro de mantenimiento preventivo en plan_mantenimiento_aulas para la semana siguiente. Aprovecha los periodos de baja ocupación para conservar la infraestructura sin afectar la operación académica.
 
-views: 
-#1. Muestra el rendimiento de estudiantes por curso y periodo.
-CREATE OR REPLACE VIEW V_RendimientoAcademico AS
-SELECT
-    e.id_estudiante,
-    CONCAT(e.nombres, ' ', e.apellidos) AS estudiante,
-    e.documento_identidad,
-    a.nombre AS asignatura,
-    p.descripcion AS periodo,
-    COUNT(c.id_calificacion) AS total_evaluaciones,
-    ROUND(SUM(c.valor * c.porcentaje) /
-          SUM(c.porcentaje), 2) AS nota_definitiva,
-    MAX(c.valor) AS nota_maxima,
-    MIN(c.valor) AS nota_minima,
-    CASE
-        WHEN ROUND(SUM(c.valor * c.porcentaje) /
-                   SUM(c.porcentaje), 2) >= 3.0
-        THEN 'Aprobado'
-        ELSE 'Reprobado'
-    END AS estado
-FROM calificacion c
-INNER JOIN estudiante e ON e.id_estudiante= c.id_estudiante
-INNER JOIN curso cu ON cu.id_curso= c.id_curso
-INNER JOIN asignatura a ON a.id_asignatura= cu.id_asignatura
-INNER JOIN periodo_academico p ON p.id_periodo= cu.id_periodo
-GROUP BY
-    e.id_estudiante, e.nombres, e.apellidos,
-    e.documento_identidad, a.nombre, p.descripcion
-ORDER BY
-    p.descripcion, estudiante;
+EVENTS:
+
+SET GLOBAL event_scheduler=ON; 
+
+#1. EVT_RecordatoriosExamenes: Genera recordatorios para exámenes programados.
+
+CREATE TABLE IF NOT EXISTS recordatorio_examen (
+id_recordatorio INT PRIMARY KEY AUTO_INCREMENT,
+id_evento INT,
+descripcion VARCHAR(255),
+fecha_examen DATE,
+dias_restantes INT,
+fecha_generacion DATETIME DEFAULT NOW()
+);
+ 
+DELIMITER $$
+ 
+CREATE EVENT EVT_RecordatoriosExamenes
+ON SCHEDULE EVERY 1 DAY
+STARTS NOW()
+ON COMPLETION PRESERVE
+DO
+BEGIN
+    INSERT INTO recordatorio_examen (id_evento, descripcion, fecha_examen, dias_restantes)
+    SELECT
+        id_evento,
+        CONCAT('Recordatorio: ', descripcion),
+        fecha,
+        DATEDIFF(fecha, CURDATE())
+    FROM evento_calendario
+    WHERE fecha BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+      AND (descripcion LIKE '%examen%'
+        OR descripcion LIKE '%parcial%'
+        OR descripcion LIKE '%final%');
+END$$
+ 
+DELIMITER ;
+
+
+#2. EVT_VerificarDevolucionesBiblioteca: Verifica diariamente devoluciones pendientes.
+
+DELIMITER $$
+ 
+
+CREATE EVENT EVT_VerificarDevolucionesBiblioteca
+ON SCHEDULE EVERY 1 DAY
+STARTS NOW()
+ON COMPLETION PRESERVE
+DO
+BEGIN
     
+    UPDATE prestamo
+    SET estado = 'Retrasado'
+    WHERE estado = 'Prestado'
+      AND fecha_devolucion < CURDATE();
+ 
     
-#2. Presenta el horario semanal de cada profesor.
+    UPDATE prestamo
+    SET multa = DATEDIFF(CURDATE(), fecha_devolucion) * 1000.00
+    WHERE estado = 'Retrasado';
+END$$
+ 
+DELIMITER ;
 
-CREATE OR REPLACE VIEW V_HorarioProfesor AS
-SELECT
-    pr.id_profesor,
-    CONCAT(pr.nombres, ' ', pr.apellidos) AS profesor,
-    pr.especialidad,
-    d.nombre AS departamento,
-    a.nombre AS asignatura,
-    h.dia,
-    h.hora_inicio,
-    h.hora_fin,
-    TIMEDIFF(h.hora_fin, h.hora_inicio) AS duracion,
-    CONCAT(au.edificio, ' - Piso ', au.piso) AS ubicacion_aula,
-    au.tipo AS tipo_aula,
-    p.descripcion AS periodo
-FROM horario h
-INNER JOIN curso cu ON cu.id_curso= h.id_curso
-INNER JOIN profesor pr ON pr.id_profesor= cu.id_profesor
-INNER JOIN departamento d ON d.id_departamento= pr.id_departamento
-INNER JOIN asignatura a ON a.id_asignatura= cu.id_asignatura
-INNER JOIN aula au ON au.id_aula= cu.id_aula
-INNER JOIN periodo_academico p ON p.id_periodo= cu.id_periodo
-ORDER BY
-    profesor,
-    FIELD(h.dia,
-        'Lunes', 'Martes', 'Miercoles',
-        'Jueves', 'Viernes', 'Sabado'),
-    h.hora_inicio;
 
-    
-#3. Detalla la ocupación de aulas por hora y día.
+#3. EVT_GenerarReporteAsistencia: Genera reportes de asistencia periódicos.
 
-CREATE OR REPLACE VIEW V_OcupacionAulas AS
-SELECT
-    au.id_aula,
-    au.edificio,
-    au.piso,
-    au.tipo AS tipo_aula,
-    au.capacidad,
-    au.estado AS estado_aula,
-    h.dia,
-    h.hora_inicio,
-    h.hora_fin,
-    a.nombre AS asignatura,
-    CONCAT(pr.nombres, ' ', pr.apellidos) AS profesor,
-    cu.cupo_maximo,
-    p.descripcion AS periodo,
-    ROUND((cu.cupo_maximo / au.capacidad) * 100, 1) AS porcentaje_ocupacion,
-    CASE
-        WHEN au.estado = 'Mantenimiento'              THEN 'No disponible'
-        WHEN (cu.cupo_maximo / au.capacidad) >= 0.9   THEN 'Alta'
-        WHEN (cu.cupo_maximo / au.capacidad) >= 0.6   THEN 'Media'
-        ELSE 'Baja'
-		  END AS nivel_ocupacion
-FROM aula au
-INNER JOIN curso cu ON cu.id_aula= au.id_aula
-INNER JOIN horario h ON h.id_curso= cu.id_curso
-INNER JOIN asignatura a ON a.id_asignatura= cu.id_asignatura
-INNER JOIN profesor pr ON pr.id_profesor= cu.id_profesor
-INNER JOIN periodo_academico p ON p.id_periodo= cu.id_periodo
-ORDER BY
-    au.edificio,
-    au.piso,
-    FIELD(h.dia,
-        'Lunes', 'Martes', 'Miercoles',
-        'Jueves', 'Viernes', 'Sabado'),
-    h.hora_inicio;
-    
-    
-#4. Lista de material prestado con fechas de devolución.
-   
-CREATE OR REPLACE VIEW V_MaterialBibliograficoPrestado AS
-SELECT
-    pr.id_prestamo,
-    mb.titulo,
-    mb.autores,
-    mb.editorial,
-    mb.categoria,
-    mb.formato,
-    mb.ubicacion,
-    pr.tipo_usuario,
-    CASE
-        WHEN pr.tipo_usuario = 'Estudiante'
-             THEN CONCAT(e.nombres,  ' ', e.apellidos)
-        WHEN pr.tipo_usuario = 'Profesor'
-             THEN CONCAT(pf.nombres, ' ', pf.apellidos)
-        ELSE 'Usuario desconocido'
-    END AS nombre_usuario,
-    pr.fecha_prestamo,
-    pr.fecha_devolucion,
-    DATEDIFF(pr.fecha_devolucion,
-             pr.fecha_prestamo) AS dias_prestamo,
-    CASE
-        WHEN pr.estado = 'Retrasado'
-             THEN DATEDIFF(CURDATE(), pr.fecha_devolucion)
-        ELSE 0
-    END AS dias_retraso,
-    pr.estado,
-    COALESCE(pr.multa, 0) AS multa
-FROM prestamo pr
-INNER JOIN material_bibliografico mb ON mb.id_material = pr.id_material
-LEFT JOIN  estudiante e
-    ON  e.id_estudiante = pr.id_usuario
-    AND pr.tipo_usuario = 'Estudiante'
-LEFT JOIN  profesor pf
-    ON  pf.id_profesor  = pr.id_usuario
-    AND pr.tipo_usuario = 'Profesor'
-ORDER BY
-    pr.estado DESC,
-    pr.fecha_devolucion
-    
-#5. Estadísticas de calificaciones por curso, profesor y periodo.
+CREATE TABLE IF NOT EXISTS reporte_asistencia_semanal (
+id_reporte INT PRIMARY KEY AUTO_INCREMENT,
+semana_inicio DATE,
+id_curso INT,
+asignatura VARCHAR(100),
+profesor VARCHAR(200),
+evaluaciones_semana INT,
+promedio_semanal DECIMAL(5,2),
+fecha_generacion DATETIME DEFAULT NOW()
+);
+ 
+DELIMITER $$
+ 
 
-CREATE OR REPLACE VIEW V_EstadisticasCalificaciones AS
-SELECT
-    cu.id_curso,
-    a.nombre AS asignatura,
-    a.area_conocimiento,
-    CONCAT(pr.nombres, ' ', pr.apellidos) AS profesor,
-    d.nombre AS departamento,
-    p.descripcion AS periodo,
-    p.estado AS estado_periodo,
-    COUNT(DISTINCT c.id_estudiante) AS estudiantes_evaluados,
-    COUNT(c.id_calificacion) AS total_evaluaciones,
-    ROUND(AVG(c.valor), 2) AS promedio_general,
-    MAX(c.valor) AS nota_maxima,
-    MIN(c.valor) AS nota_minima,
-    ROUND(STDDEV(c.valor), 2) AS desviacion_estandar,
-    SUM(CASE WHEN c.valor >= 3.0 THEN 1 ELSE 0 END) AS aprobados,
-    SUM(CASE WHEN c.valor  < 3.0 THEN 1 ELSE 0 END) AS reprobados,
-    ROUND(
-        (SUM(CASE WHEN c.valor >= 3.0 THEN 1 ELSE 0 END) /
-         COUNT(c.id_calificacion)) * 100, 1
-)                                                 AS porcentaje_aprobacion
-FROM calificacion c
-INNER JOIN curso cu ON cu.id_curso= c.id_curso
-INNER JOIN asignatura a ON a.id_asignatura= cu.id_asignatura
-INNER JOIN profesor pr ON pr.id_profesor= cu.id_profesor
-INNER JOIN departamento d ON d.id_departamento= pr.id_departamento
-INNER JOIN periodo_academico p ON p.id_periodo = cu.id_periodo
-GROUP BY
-    cu.id_curso, a.nombre, a.area_conocimiento,
-    pr.nombres, pr.apellidos,
-    d.nombre, p.descripcion, p.estado
-ORDER BY
-    p.descripcion, a.nombre;
+CREATE EVENT EVT_GenerarReporteAsistencia
+ON SCHEDULE EVERY 1 WEEK
+STARTS NOW()
+ON COMPLETION PRESERVE
+DO
+BEGIN
+    DECLARE v_inicio DATE DEFAULT DATE_SUB(CURDATE(), INTERVAL 7 DAY);
+ 
+    INSERT INTO reporte_asistencia_semanal
+        (semana_inicio, id_curso, asignatura, profesor, evaluaciones_semana, promedio_semanal)
+    SELECT
+        v_inicio,
+        cu.id_curso,
+        a.nombre,
+        CONCAT(pr.nombres, ' ', pr.apellidos),
+        COUNT(c.id_calificacion),
+        ROUND(AVG(c.valor), 2)
+    FROM curso cu
+    INNER JOIN asignatura a  ON a.id_asignatura = cu.id_asignatura
+    INNER JOIN profesor   pr ON pr.id_profesor  = cu.id_profesor
+    LEFT  JOIN calificacion c
+        ON c.id_curso = cu.id_curso
+       AND c.fecha BETWEEN v_inicio AND CURDATE()
+    GROUP BY cu.id_curso, a.nombre, pr.nombres, pr.apellidos;
+END$$
+ 
+DELIMITER ;
+
+#4. EVT_ActualizarEstadoMatriculas: Actualiza el estado de matrículas al iniciar/finalizar periodos.
+
+
+DELIMITER $$
+
+
+CREATE EVENT EVT_ActualizarEstadoMatriculas
+ON SCHEDULE EVERY 1 DAY
+STARTS NOW()
+ON COMPLETION PRESERVE
+DO
+BEGIN
     
+    UPDATE periodo_academico
+    SET estado = 'Activo'
+    WHERE estado = 'Planeado'
+      AND fecha_inicio <= CURDATE()
+      AND fecha_fin    >= CURDATE();
+ 
+    
+    UPDATE periodo_academico
+    SET estado = 'Finalizado'
+    WHERE estado IN ('Activo', 'Planeado')
+      AND fecha_fin < CURDATE();
+END$$
+ 
+DELIMITER ;
+
+
+#5. EVT_ProgramarMantenimientoAulas: Programa mantenimientos preventivos para aulas.
+
+
+CREATE TABLE IF NOT EXISTS plan_mantenimiento_aulas (
+id_mantenimiento INT PRIMARY KEY AUTO_INCREMENT,
+id_aula INT,
+fecha_programada DATE,
+estado VARCHAR(30) DEFAULT 'Programado',
+observacion TEXT,
+fecha_registro DATETIME DEFAULT NOW()
+);
+ 
+DELIMITER $$
+ 
+CREATE EVENT EVT_ProgramarMantenimientoAulas
+ON SCHEDULE EVERY 1 WEEK
+STARTS NOW()
+ON COMPLETION PRESERVE
+DO
+BEGIN
+    
+    INSERT INTO plan_mantenimiento_aulas (id_aula, fecha_programada, observacion)
+    SELECT
+        id_aula,
+        DATE_ADD(CURDATE(), INTERVAL 7 DAY),
+        CONCAT('Mantenimiento preventivo — ', edificio, ' Piso ', piso, ' (', tipo, ')')
+    FROM aula
+    WHERE estado = 'Disponible'
+      AND id_aula NOT IN (
+          SELECT DISTINCT cu.id_aula
+          FROM curso cu
+          INNER JOIN periodo_academico pa ON pa.id_periodo = cu.id_periodo
+          WHERE pa.estado = 'Activo'
+      );
+END$$
+
+
